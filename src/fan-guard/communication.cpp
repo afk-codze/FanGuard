@@ -28,6 +28,19 @@ PubSubClient client(espClient);  // MQTT client instance
 
 char msg[MSG_BUFFER_SIZE];   // Buffer for MQTT messages
 
+
+void send_anomaly_mqtt(data_to_send_t ina_anomaly){
+  xQueueSend(xQueue_data, &ina_anomaly, 0);
+  xTaskCreate(communication_task, "communication_task", 4096, xTaskGetCurrentTaskHandle(), 1, NULL);
+  if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10000)) == 0) {
+    // Timeout occurred
+    Serial.println("[ERROR] Notification timeout - MQTT task not responding");
+  } else {
+    Serial.println("Received notification from MQTT task");
+  }
+}
+
+
 /* WiFi Management ---------------------------------------------------------- */
 /**
  * @brief Initializes and manages WiFi connection
@@ -76,7 +89,6 @@ void wifi_init(){
     if (numberOfTries <= 0) {
       Serial.printf("[WiFi] Max retries exceeded\n");
       WiFi.disconnect();
-      sending_window = false;
       vTaskDelete(NULL);; 
     } else {
       numberOfTries--;
@@ -102,7 +114,6 @@ void connect_mqtt() {
   while (!client.connect(clientId)) {
     if(numberOfTries <= 0){
       Serial.printf("[MQTT] Max retries exceeded ");
-      sending_window = false;
       vTaskDelete(NULL);
     }else{
       numberOfTries--;
@@ -121,106 +132,58 @@ void connect_mqtt() {
 }
 
 void send_mqtt(){
-  data_to_send_t rms_data;
-  if(anomaly_detected && !anomaly_sent){
-    send_to_mqtt(anomaly);
-  }
-  
-  while(xQueueReceive(xQueue_data, &rms_data, (TickType_t)100)) {
-    Serial.printf("----%d,%d----",anomaly.time_stamp,rms_data.time_stamp);
-    send_to_mqtt(rms_data);
+  data_to_send_t data;
+  while(xQueueReceive(xQueue_data, &data, (TickType_t)100)) {
+    Serial.printf("----%d----",data.time_stamp);
+    send_to_mqtt(data);
   }
 }
 
-bool prepare_signed_json(data_to_send_t data_to_send, char* json_buffer, size_t buffer_size) {
-  // Create a JSON document for the payload
-  StaticJsonDocument<200> doc;
-  
-  // Add sensor data
-  if(data_to_send.anomaly)
-    doc["status"] = "ANOMALY";
-  
-  doc["x"] = data_to_send.rms_array[0];
-  doc["y"] = data_to_send.rms_array[1];
-  doc["z"] = data_to_send.rms_array[2];
-  
-  // Prepare authentication data
-  auth_data_t auth;
-  auth.session_id = g_session_id;
-  auth.seq_number = get_next_sequence_number();
-  auth.timestamp = data_to_send.time_stamp;
-  
-  // Add authentication data to JSON
-  doc["session_id"] = auth.session_id;
-  doc["seq"] = auth.seq_number;
-  doc["time"] = auth.timestamp;
-  
-  // Serialize the JSON document to a temporary buffer for HMAC calculation
-  char temp_buffer[200];
-  size_t json_len = serializeJson(doc, temp_buffer, sizeof(temp_buffer));
-  
-  // Calculate HMAC
-  uint8_t hmac_result[HMAC_OUTPUT_LENGTH];
-  if (!calculate_hmac(temp_buffer, json_len, &auth, hmac_result)) {
-    Serial.println("[AUTH] Failed to calculate HMAC");
-    return false;
-  }
-  
-  // Convert HMAC to hex string
-  char hmac_hex[HMAC_OUTPUT_LENGTH * 2 + 1];
-  hmac_to_hex_string(hmac_result, hmac_hex);
-  
-  // Add HMAC to JSON document
-  doc["hmac"] = hmac_hex;
-  
-  // Serialize the final JSON with HMAC
-  size_t final_len = serializeJson(doc, json_buffer, buffer_size);
-  if (final_len >= buffer_size - 1) {
-    Serial.println("[AUTH] JSON buffer too small");
-    return false;
-  }
-  
-  return true;
-}
 
+float round_to_2dp(float value) {
+    return round(value * 100) / 100;
+}
 
 /**
  * @brief Publishes data to MQTT broker
  */
 void send_to_mqtt(data_to_send_t data_to_send){
-  
-  // Prepare signed JSON message
-  if (!prepare_signed_json(data_to_send, msg, MSG_BUFFER_SIZE)) {
-    Serial.println("[MQTT] Failed to prepare authenticated message");
-    return;
-  }
+  StaticJsonDocument<256> doc;
+
+  doc["time_stamp"] = data_to_send.time_stamp;
+  doc["type"] = dataTypeToString(data_to_send.type); 
+  doc["classification"] = dataClassificationToString(data_to_send.classification);
+  doc["data"] = data_to_send.data; 
+
+  char jsonBuffer[256];
+  serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
+
+  Serial.print("Sending JSON: ");
+  Serial.println(jsonBuffer);
 
   String topicStr;
-  if (!data_to_send.anomaly) {
-    topicStr = String(id_device) + "/" + DATASTREAM_RMS_TOPIC;
+  if (data_to_send.type == TYPE_MPU) {
+    topicStr = String(id_device) + "/" + MPU_TOPIC;
   } else {
-    topicStr = String(id_device) + "/" + ANOMALY_RMS_TOPIC;
+    topicStr = String(id_device) + "/" + INA_TOPIC;
   }
   const char* topic = topicStr.c_str();
-  Serial.printf("\ndata_to_send.anomaly:%d,anomaly_sent:%d,anomaly_detected:%d\n",data_to_send.anomaly,anomaly_sent,anomaly_detected);
-  Serial.printf("\n**** %s ****\n",msg);
-  //Serial.printf("\ndata_to_send.anomaly:%d,anomaly_sent:%d,anomaly_detected:%d\n",data_to_send.anomaly,anomaly_sent,anomaly_detected);
   Serial.printf("\nTopic: %s\n",topic);
-  if (client.publish(topic, msg)){
-    Serial.printf("[MQTT] Publishing: %s\n", msg);
-    if (data_to_send.anomaly)
-      anomaly_sent = true;
+  if (client.publish(topic, jsonBuffer)){
+    Serial.printf("[MQTT] Publishing: %s\n", jsonBuffer);
   }else{
-    Serial.printf("[MQTT] ERROR while publishing rms: %s\n", msg);
+    Serial.printf("[MQTT] ERROR while publishing rms: %s\n", jsonBuffer);
     Serial.printf("client.connected(): %d",client.connected());
   }
 }
+
 
 void communication_task(void *args){
   esp_wifi_start();
   wifi_init();
   connect_mqtt();
   send_mqtt();
-  sending_window = false;
+  esp_wifi_stop();
+  xTaskNotifyGive((TaskHandle_t)args);
   vTaskDelete(NULL);
 }

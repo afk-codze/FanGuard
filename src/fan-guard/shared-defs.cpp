@@ -3,15 +3,31 @@
 #include "config.h"
 #include "shared-defs.h"
 
-volatile bool sending_window = false;
 QueueHandle_t xQueue_data = NULL;
-TaskHandle_t fft_sampling_task_handle = NULL;
-TaskHandle_t communication_mqtt_task_handle = NULL;
-TaskHandle_t main_task_handle = NULL;
-TaskHandle_t wifi_task_handle = NULL;
-bool this_reboot_send_rms = true;
-bool g_is_wakeup_from_deep_sleep = false;
-int id_device = 0;
+
+RTC_DATA_ATTR volatile bool is_first_boot = true;
+RTC_DATA_ATTR int id_device = 0;
+RTC_DATA_ATTR uint8_t calculated_threshold=0;
+
+const char* dataTypeToString(DataType type) {
+  switch (type) {
+    case TYPE_INA: return "INA";
+    case TYPE_MPU: return "MPU";
+    default:  return "unknown";
+  }
+}
+
+const char* dataClassificationToString(DataClassification classification) {
+  switch (classification) {
+    case CLASS_1:    return "CLASS_1";
+    case CLASS_2: return "CLASS_2";
+    case CLASS_3:     return "CLASS_3";
+    default:                  return "unknown";
+  }
+}
+
+
+
 void init_shared_queues() {
     xQueue_data = xQueueCreate(QUEUE_SIZE, sizeof(data_to_send_t));
     if(xQueue_data ==  NULL) {

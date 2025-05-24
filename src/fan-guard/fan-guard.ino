@@ -1,83 +1,84 @@
-
 #include <Arduino.h>
 #include <Wire.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "fft-and-adaptive-sampling.h"
-#include <MPU6500_WE.h>
-#include <Wire.h>
 #include "shared-defs.h"
-#include "communication.h"
-#include "hmac.h"
 #include "driver/adc.h"
 #include "esp_bt.h"
 #include "esp_wifi.h"
 #include "esp_sleep.h"
 #include "esp_pm.h"
+#include "ina-library.h"
+#include "MPU6500-library.h"
+#include "sampling.h"
+#include "driver/uart.h"
 
 #define BUZZER_PIN 23
-MPU6500_WE myMPU6500(MPU6500_ADDR);
-// const int csPin = 5;  // Chip Select Pin
-// // const int mosiPin = 22;  // "MOSI" Pin
-// // const int misoPin = 21;  // "MISO" Pin
-// // const int sckPin = 16;  // SCK Pin
-// bool useSPI = true;    // SPI use flag
 
+#define DEEP_SLEEP_INA_SEC 10
+#define DEEP_SLEEP_INA_US (DEEP_SLEEP_INA_SEC * 1000ULL * 1000ULL)
 
-// /* There are two constructors for SPI: */
-// MPU6500_WE myMPU6500 = MPU6500_WE(&SPI, csPin, useSPI);
-
-TaskHandle_t send_anomaly_task_handler  = NULL;
-
-void buzzer_anomaly_task(void *args){
-  if(anomaly_detected){
-    while(1){
-      digitalWrite(BUZZER_PIN, HIGH);
-      vTaskDelay(pdMS_TO_TICKS(100));
-      digitalWrite(BUZZER_PIN, LOW);
-      vTaskDelay(pdMS_TO_TICKS(900));
-    }
-  }
-  vTaskDelete(NULL);
+void deep_sleep() {
+  esp_wifi_stop();
+  Serial.flush();
+  esp_sleep_enable_timer_wakeup(DEEP_SLEEP_INA_US);
+  esp_deep_sleep_start();
 }
 
-void setup() {
-  Serial.begin(115200);
-  Wire.begin();
-  pinMode(BUZZER_PIN,OUTPUT);
-  main_task_handle = xTaskGetCurrentTaskHandle();
-  if(!myMPU6500.init()){
-    Serial.println("MPU6500 does not respond");
-  }
-  else{
-    Serial.println("MPU6500 is connected");
-  }
-
-  hmac_auth_init();
-
-  // Queues initialization
-  init_shared_queues();
-
+void first_boot_init(){
   // Calc id device
   for (int i = 0; i < 17; i = i + 8) {
     id_device |= ((ESP.getEfuseMac() >> (40 - i)) & 0xff) << i;
   }
+  xTaskCreatePinnedToCore(build_baseline_mpu6500, "build_basline_mpu", 4096, xTaskGetCurrentTaskHandle(), 1, NULL, 0);
+  xTaskCreatePinnedToCore(build_baseline_ina, "build_baseline_ina", 4096, xTaskGetCurrentTaskHandle(), 1, NULL, 1);
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(41,42);
+  // Set up interrupt pin
+  pinMode(INT_PIN, INPUT_PULLUP); // Set up interrupt pin with pull-up  
+  ina219_init();
+  acc_init();
+  // Queues initialization
+  init_shared_queues();
+
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.println("Woke up from deep sleep by MPU6500 interrupt!");
+    motion_anomaly = true; // Set anomaly_motion flag if woke by interrupt
+  } else if(wakeup_reason == ESP_SLEEP_WAKEUP_TIMER){
+    Serial.println("Woke up from deep sleep by INA timer");
+    xTaskCreate(ina_periodic_check, "ina_periodic_check", 8096, xTaskGetCurrentTaskHandle(), 1, NULL);
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  }else{
+    Serial.println("Normal boot or other wakeup reason.");
+  }
+
+  if(is_first_boot){
+    first_boot_init();
+    is_first_boot = false;
+  }
+
   Serial.printf("Device ID: %llX\n", id_device); // Print device ID
-  Serial.println("MPU6500 - calibrating...");
-  delay(1000);
-  myMPU6500.autoOffsets();
-
-  Serial.println("Done!");
-
-  myMPU6500.setAccRange(MPU9250_ACC_RANGE_2G);
-  myMPU6500.enableAccDLPF(true);
-  myMPU6500.setAccDLPF(MPU9250_DLPF_6);
   
-  //xTaskCreatePinnedToCore(send_anomaly_task, "send_anomaly_task", 4096, NULL, 1, &send_anomaly_task_handler,1);
-  xTaskCreatePinnedToCore(fft_sampling_task, "fft_sampling_task", 8192, NULL, 1, &fft_sampling_task_handle,0);
-  //xTaskCreatePinnedToCore(buzzer_anomaly_task, "buzzer_anomaly_task", 4096, NULL, 1, NULL,1);
+  if(motion_anomaly){
+    motion_anomaly = false;
+    Serial.print("*** Anomaly ***");
+    xTaskCreate(high_freq_sampling, "high_freq_sampling", 8096, xTaskGetCurrentTaskHandle(), 1, NULL);
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  }
+  
+
+  // Enable the motion interrupt with our calculated threshold
+  enable_motion_interrupt(calculated_threshold);
+  
+  deep_sleep();
 }
 
 void loop() {
- vTaskDelete(NULL); // Delete the task if it is not needed anymore
+  vTaskDelete(NULL);
 }

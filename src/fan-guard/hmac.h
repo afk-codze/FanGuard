@@ -23,7 +23,7 @@ typedef struct {
 
 // Global authentication state
 extern uint32_t g_session_id;        // Stored in flash memory
-extern uint32_t g_sequence_number; // Persists through deep sleep
+extern RTC_DATA_ATTR uint32_t g_sequence_number; // Persists through deep sleep
 
 /**
  * @brief Initialize the HMAC authentication system
